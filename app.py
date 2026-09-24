@@ -9,15 +9,16 @@
 2. Из файла поставщика в файл загрузки переносятся значения столбцов
    SUM_N1..SUM_N16, ZADOLG1..ZADOLG16, MZADOLG1..MZADOLG16
    (соединение строк по столбцу KOD).
-3. DOGOVOR1..DOGOVOR16: если в файле поставщика для блока
-   заполнены и GLAVA<N>, и SUM_N<N> (не пусто и не 0) -> 1, иначе 0.
+3. DOGOVOR1..DOGOVOR16: если в файле для загрузки GLAVA<N> (текстовое)
+   имеет значение и SUM_N<N> после переноса > 0 (не пусто и не 0;
+   отрицательная сумма переносится как 0) -> 1, иначе 0.
 4. В файл загрузки добавляется столбец "Определять тариф по площади" = 1.
 5. Если KOD отсутствует в файле поставщика -> в SUM_N/ZADOLG/MZADOLG
    ставятся 0. Если столбца KOD нет в файле для загрузки -> сообщение
    "Код семьи не найден (нет столбца KOD в файле для загрузки)".
-6. Если KOD повторяется в файле поставщика несколько раз -> берётся
-   НАИБОЛЬШЕЕ значение SUM_N по каждому блоку (для ZADOLG/MZADOLG тоже
-   берётся максимум).
+6. Если KOD повторяется в файле поставщика несколько раз -> переносится
+   ЦЕЛИКОМ запись с НАИБОЛЬШИМ значением SUM_N (сравнение максимальных
+   сумм по всем блокам 1..16; при равенстве — первая из записей).
 7. GLAVA1..GLAVA16 имеют текстовый формат (значения из файла загрузки
    сохраняются как есть).
 8. Если в MZADOLG1..MZADOLG16 есть какая-либо информация (не пусто и не 0),
@@ -32,12 +33,14 @@
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import traceback
+from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -181,6 +184,32 @@ def num_or_zero(v):
     """Значение для переноса в SUM_N/ZADOLG/MZADOLG: число или 0."""
     n = to_number(v)
     return 0 if n is None else n
+
+
+def _block_index(col):
+    """'SUM_N3'/'MZADOLG12'/'ZADOLG4' -> 3/12/4, иначе None."""
+    m = re.match(r"^(?:SUM_N|MZADOLG|ZADOLG)(\d+)$", col)
+    return int(m.group(1)) if m else None
+
+
+def pick_max_block(rows):
+    """Из списка строк поставщика выбирает «наибольшую» по SUM_N.
+
+    Сравниваются суммы во всех блоках SUM_N1..SUM_N16: берётся строка,
+    у которой максимальная из сумм наибольшая (при равенстве — первая).
+    Если ни в одной строке нет заполненных SUM_N — возвращается первая.
+    """
+    best, best_key = None, None
+    for r in rows:
+        nums = [to_number(v) for c, v in r.items()
+                if c.startswith("SUM_N") and _block_index(c)]
+        nums = [n for n in nums if n is not None]
+        key = max(nums) if nums else None
+        if best is None:
+            best, best_key = r, key
+        elif key is not None and (best_key is None or key > best_key):
+            best, best_key = r, key
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -401,33 +430,19 @@ def process(supplier_path, target_path, out_path):
         warnings.append("В файл загрузки добавлены столбцы из файла "
                         "поставщика: %s" % ", ".join(missing_cols))
 
-    # --- индекс поставщика по KOD (максимумы при дублях) ---------------------
-    sup_index = {}
-    dup_kods = set()
+    # --- индекс поставщика по KOD (при дублях — запись с наибольшей SUM_N) ---
+    sup_groups = {}
     for row in sup_rows:
         kod = cell_to_str(row.get("KOD"))
         if kod == "":
             continue
-        if kod in sup_index:
-            dup_kods.add(kod)
-        cur = sup_index.get(kod)
-        merged = dict(cur) if cur else {}
-        for key, val in row.items():
-            if key.startswith(("SUM_N", "ZADOLG", "MZADOLG")):
-                a, b = to_number(merged.get(key)), to_number(val)
-                if a is None:
-                    merged[key] = val
-                elif b is not None and b > a:
-                    merged[key] = val
-            elif key.startswith("GLAVA"):
-                if not has_info(merged.get(key)) and has_info(val):
-                    merged[key] = val
-            else:
-                merged.setdefault(key, val)
-        sup_index[kod] = merged
+        sup_groups.setdefault(kod, []).append(row)
+    dup_kods = {k for k, v in sup_groups.items() if len(v) > 1}
+    sup_index = {k: (v[0] if len(v) == 1 else pick_max_block(v))
+                 for k, v in sup_groups.items()}
     if dup_kods:
         warnings.append("В файле поставщика KOD повторяется: %s — "
-                        "взяты наибольшие значения."
+                        "взята запись с наибольшей суммой (SUM_N)."
                         % ", ".join(sorted(dup_kods)))
 
     # --- итоговый набор столбцов --------------------------------------------
@@ -439,12 +454,14 @@ def process(supplier_path, target_path, out_path):
     result = []
     matched = 0
     unmatched = []
+    report_rows = []  # построчная информация для отчёта о выполнении
     for row in tgt_rows:
         if all(cell_to_str(v) == "" for v in row.values()):
             continue
         kod = cell_to_str(row.get("KOD"))
         sup = sup_index.get(kod)
         out = dict(row)
+        neg_fixed = 0
         if sup is None:
             unmatched.append(kod)
             # данных поставщика нет -> во все блоки ставим 0
@@ -452,25 +469,20 @@ def process(supplier_path, target_path, out_path):
                 out["SUM_N%d" % i] = "0"
                 out["ZADOLG%d" % i] = "0"
                 out["MZADOLG%d" % i] = "0"
-                out["DOGOVOR%d" % i] = "0"
         else:
             matched += 1
             for i in range(1, MAX_BLOCKS + 1):
                 s_sum = sup.get("SUM_N%d" % i)
                 s_mz = sup.get("MZADOLG%d" % i)
-                s_glava = sup.get("GLAVA%d" % i)
 
                 # перенос числовых данных из файла поставщика (пустое -> 0)
                 # отрицательная сумма переносится как 0
                 sv = num_or_zero(s_sum)
                 if isinstance(sv, (int, float)) and sv < 0:
                     sv = 0
+                    neg_fixed += 1
                 out["SUM_N%d" % i] = fmt_num(sv)
                 out["MZADOLG%d" % i] = fmt_num(num_or_zero(s_mz))
-
-                # DOGOVOR: GLAVA и SUM_N заполнены -> 1, иначе 0
-                ok = has_info(s_glava) and has_info(s_sum)
-                out["DOGOVOR%d" % i] = "1" if ok else "0"
 
                 # ZADOLG: есть информация в MZADOLG -> 1, иначе 0
                 out["ZADOLG%d" % i] = "1" if has_info(s_mz) else "0"
@@ -494,8 +506,35 @@ def process(supplier_path, target_path, out_path):
                 else:
                     out[c] = cell_to_str(sup.get(c))
 
+        # DOGOVOR1..16: если в полях GLAVA<N> (файл для загрузки,
+        # текстовые) ЕСТЬ значение и в SUM_N<N> (после переноса из
+        # поставщика) есть сумма -> 1, иначе 0. Считается ПОСЛЕ переноса
+        # данных, поэтому при пустой GLAVA<N> всегда 0.
+        for i in range(1, MAX_BLOCKS + 1):
+            ok = (has_info(out.get("GLAVA%d" % i))
+                  and has_info(out.get("SUM_N%d" % i)))
+            out["DOGOVOR%d" % i] = "1" if ok else "0"
+
         out[new_col] = "1"
         result.append(out)
+
+        # строка отчёта о выполнении по данной семье
+        filled_blocks = sum(1 for i in range(1, MAX_BLOCKS + 1)
+                            if has_info(out.get("SUM_N%d" % i)))
+        dogovor_cnt = sum(1 for i in range(1, MAX_BLOCKS + 1)
+                          if out.get("DOGOVOR%d" % i) == "1")
+        zadolg_cnt = sum(1 for i in range(1, MAX_BLOCKS + 1)
+                         if out.get("ZADOLG%d" % i) == "1")
+        report_rows.append({
+            "kod": kod,
+            "status": ("совпал с файлом поставщика" if sup is not None
+                       else "код семьи не найден в файле поставщика — "
+                            "проставлены 0"),
+            "blocks": filled_blocks,
+            "dogovor": dogovor_cnt,
+            "zadolg": zadolg_cnt,
+            "neg": neg_fixed,
+        })
 
     if unmatched:
         warnings.append("Код семьи не найден в файле поставщика (проставлены 0): "
@@ -508,9 +547,77 @@ def process(supplier_path, target_path, out_path):
         "out_path": out_path,
         "rows": len(result),
         "matched": matched,
+        "unmatched": unmatched,
         "warnings": warnings,
+        "supplier_path": supplier_path,
+        "target_path": target_path,
+        "report_rows": report_rows,
+        "dup_kods": sorted(dup_kods),
+        "missing_cols": missing_cols,
+        "new_col": new_col,
     }
     return summary
+
+
+def build_report_text(summary):
+    """Формирует текст отчёта о выполнении (для скачивания в .txt)."""
+    lines = []
+    add = lines.append
+    add("ОТЧЁТ О ВЫПОЛНЕНИИ ОБРАБОТКИ ДАННЫХ")
+    add("=" * 60)
+    add("Дата/время формирования: %s"
+        % datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    add("")
+    add("Файл данных от поставщика:   %s" % summary["supplier_path"])
+    add("Файл для загрузки в Комплекс: %s" % summary["target_path"])
+    add("Файл результата:              %s" % summary["out_path"])
+    add("")
+    add("-" * 60)
+    add("ИТОГИ")
+    add("-" * 60)
+    add("Всего строк обработано:            %d" % summary["rows"])
+    add("Совпадений по KOD с поставщиком:   %d" % summary["matched"])
+    add("KOD не найдено у поставщика:       %d%s"
+        % (len(summary["unmatched"]),
+           " (%s)" % ", ".join(summary["unmatched"]) if summary["unmatched"] else ""))
+    add("Дублирующихся KOD у поставщика:    %d%s"
+        % (len(summary["dup_kods"]),
+           " (%s) — взята запись с наибольшей суммой" % ", ".join(summary["dup_kods"])
+           if summary["dup_kods"] else ""))
+    add("Столбец «%s»: добавлен, значение 1 во всех строках."
+        % summary["new_col"])
+    if summary["missing_cols"]:
+        add("Добавлены столбцы из файла поставщика: %s"
+            % ", ".join(summary["missing_cols"]))
+    add("")
+    add("-" * 60)
+    add("ПОСТРОЧНО (по KOD семьи)")
+    add("-" * 60)
+    for i, r in enumerate(summary["report_rows"], 1):
+        add("%d. KOD %s — %s; блоков с суммой: %d из 16; "
+            "DOGOVOR=1: %d; ZADOLG=1: %d; отрицательных SUM_N заменено на 0: %d"
+            % (i, r["kod"], r["status"], r["blocks"], r["dogovor"],
+               r["zadolg"], r["neg"]))
+    add("")
+    add("-" * 60)
+    add("ПРЕДУПРЕЖДЕНИЯ")
+    add("-" * 60)
+    if summary["warnings"]:
+        for w in summary["warnings"]:
+            add("⚠ " + w)
+    else:
+        add("Предупреждений нет.")
+    add("")
+    add("Правила обработки:")
+    add("— SUM_N/ZADOLG/MZADOLG 1..16 переносятся из файла поставщика "
+        "по KOD; при отсутствии KOD — 0;")
+    add("— при дублях KOD переносится целиком запись с наибольшим SUM_N;")
+    add("— отрицательная сумма SUM_N переносится как 0;")
+    add("— DOGOVOR<N>=1, если GLAVA<N> заполнена и SUM_N<N> содержит сумму, "
+        "иначе 0;")
+    add("— есть данные в MZADOLG<N> -> ZADOLG<N>=1, иначе 0;")
+    add("— столбец «%s» = 1." % summary["new_col"])
+    return "\r\n".join(lines) + "\r\n"
 
 
 def write_output(out_path, columns, result, warnings):
@@ -624,6 +731,10 @@ class App(tk.Tk):
                                   command=self.start_process)
         self.run_btn.grid(row=4, column=0, sticky="w", pady=(4, 10))
 
+        self.report_btn = ttk.Button(frm, text="Скачать отчёт о выполнении (.txt)",
+                                     command=self.save_report, state="disabled")
+        self.report_btn.grid(row=4, column=1, sticky="we", pady=(4, 10))
+
         ttk.Label(frm, textvariable=self.status_var, foreground="#004085",
                   wraplength=640, justify="left").grid(
             row=5, column=0, columnspan=2, sticky="w")
@@ -687,6 +798,15 @@ class App(tk.Tk):
         self.progress.stop()
         self.run_btn.config(state="normal")
         self._result = res
+        self.report_btn.config(state="normal")
+        # отчёт о выполнении сохраняется рядом с файлом результата
+        report_path = os.path.splitext(res["out_path"])[0] + "_отчёт.txt"
+        try:
+            with open(report_path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(build_report_text(res))
+            self._report_path = report_path
+        except OSError:
+            self._report_path = None
         msg = ("Обработка завершена. Строк: %d, совпадений по KOD: %d."
                % (res["rows"], res["matched"]))
         for w in res["warnings"]:
@@ -696,6 +816,10 @@ class App(tk.Tk):
                "Скачать (сохранить) файл результатов?" % msg)
         if messagebox.askyesno("Готово", ask):
             self._save_and_offer(res["out_path"])
+        if self._report_path and messagebox.askyesno(
+                "Отчёт о выполнении",
+                "Скачать отчёт о выполнении в формате .txt?"):
+            self.save_report()
 
     def _fail(self, err):
         self._busy = False
@@ -703,6 +827,37 @@ class App(tk.Tk):
         self.run_btn.config(state="normal")
         self.status_var.set("Ошибка обработки.")
         messagebox.showerror("Ошибка", err)
+
+    # ---- скачивание отчёта о выполнении -------------------------------------
+    def save_report(self):
+        res = getattr(self, "_result", None)
+        if not res:
+            messagebox.showinfo("Отчёт",
+                                "Сначала выполните обработку данных.")
+            return
+        text = build_report_text(res)
+        default_name = os.path.splitext(os.path.basename(res["out_path"]))[0] \
+            + "_отчёт.txt"
+        path = filedialog.asksaveasfilename(
+            title="Скачать отчёт о выполнении (.txt)",
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(text)
+            self.status_var.set("Отчёт сохранён: %s" % path)
+            if os.name == "nt":
+                try:
+                    os.startfile(os.path.dirname(path))
+                except Exception:
+                    pass
+            messagebox.showinfo("Сохранено", "Отчёт сохранён:\n%s" % path)
+        except OSError as e:
+            messagebox.showerror("Ошибка",
+                                 "Не удалось сохранить отчёт:\n%s" % e)
 
     # ---- скачивание результата ----------------------------------------------
     def _save_and_offer(self, auto_path):
