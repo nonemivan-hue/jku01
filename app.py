@@ -32,10 +32,15 @@
     данных от поставщика (можно сразу несколько) и один файл для загрузки
     в Комплекс. Логика та же, кроме: DOGOVOR1..16 = 1 только при наличии
     данных в SUM_N1..16 (без проверки GLAVA), а поле GLAVA<N> очищается.
+13. Программа ведёт журнал работы (логи) в папке «логи» рядом с программой;
+    журнал можно выгрузить кнопкой «Выгрузить журнал работы (.log)».
 
 Запуск: python app.py  (графический интерфейс, Windows)
 """
 
+import atexit
+import logging
+import logging.handlers
 import os
 import re
 import shutil
@@ -48,6 +53,165 @@ from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+
+# ---------------------------------------------------------------------------
+# Журнал работы программы (логирование и выгрузка логов)
+# ---------------------------------------------------------------------------
+
+APP_TITLE = "Обработчик данных поставщика для загрузки в Комплекс"
+LOG_DIRNAME = "логи"                  # каталог с журналами работы
+LOG_KEEP_COUNT = 30                  # сколько последних журналов хранить
+
+
+def get_app_dir():
+    """Каталог программы (для .exe, собранного PyInstaller, — папка exe)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_log_dir():
+    """Каталог журналов работы программы (создаётся при необходимости)."""
+    d = os.path.join(get_app_dir(), LOG_DIRNAME)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = os.getcwd()
+    return d
+
+
+def build_log_text(records=None):
+    """Текст журнала работы программы для выгрузки (.txt/.log).
+
+    records — записи из RingBuffer; по умолчанию — текущее содержимое буфера.
+    """
+    if records is None:
+        records = list(_log_ring.records) if _log_ring else []
+    lines = []
+    add = lines.append
+    add("ЖУРНАЛ РАБОТЫ ПРОГРАММЫ")
+    add("Программа: %s" % APP_TITLE)
+    add("Версия Python: %s" % sys.version.replace("\n", " "))
+    add("Запуск сессии: %s" % _log_session_start.strftime("%d.%m.%Y %H:%M:%S"))
+    add("Формирование журнала: %s"
+        % datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    add("Файл постоянного журнала: %s" % (_log_file_path or "(не создан)"))
+    add("=" * 60)
+    add("")
+    if not records:
+        add("(записей в журнале пока нет)")
+    for rec in records:
+        ts = datetime.fromtimestamp(rec.created).strftime("%d.%m.%Y %H:%M:%S")
+        add("%s | %-8s | %s" % (ts, rec.levelname, rec.getMessage()))
+        if rec.exc_info and rec.exc_info[0] is not None:
+            for ln in traceback.format_exception(*rec.exc_info):
+                add("    " + ln.rstrip("\n"))
+    add("")
+    add("Всего записей в журнале: %d" % len(records))
+    return "\r\n".join(lines) + "\r\n"
+
+
+class RingBufferHandler(logging.Handler):
+    """Хранит последние N записей журнала в памяти — для вылога в файл."""
+
+    def __init__(self, capacity=2000):
+        super().__init__()
+        self.capacity = capacity
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+        if len(self.records) > self.capacity:
+            del self.records[:len(self.records) - self.capacity]
+
+
+class UiLogHandler(logging.Handler):
+    """Последняя запись журнала выводится в строку состояния интерфейса."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+            self.app.after(0, self.app._show_log_status, msg)
+        except Exception:
+            pass
+
+
+_log = logging.getLogger("app")
+_log.setLevel(logging.DEBUG)
+_log.propagate = False
+_log_ring = None       # заполняется в setup_logging()
+_log_file_path = None  # путь к постоянному файлу журнала текущей сессии
+_log_session_start = datetime.now()
+
+
+def setup_logging(log_path=None):
+    """Настраивает журнал работы программы: постоянный файл + буфер в памяти.
+
+    Файл складывается в подпапку «логи» рядом с программой; хранится не более
+    LOG_KEEP_COUNT последних файлов. Возвращает путь к файлу журнала.
+    """
+    global _log_ring, _log_file_path
+    if _log.handlers:          # уже настроено
+        return _log_file_path
+    if log_path is None:
+        log_path = os.path.join(
+            get_log_dir(),
+            "run_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+    try:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        _log_file_path = log_path
+    except OSError:
+        fh = None
+    ring = RingBufferHandler()
+    _log_ring = ring
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s",
+                            datefmt="%d.%m.%Y %H:%M:%S")
+    if fh is not None:
+        fh.setFormatter(fmt)
+        _log.addHandler(fh)
+    _log.addHandler(ring)
+    # консоль (если запуск не из .exe без консоли)
+    if not getattr(sys, "frozen", False):
+        try:
+            sh = logging.StreamHandler()
+            sh.setFormatter(fmt)
+            _log.addHandler(sh)
+        except Exception:
+            pass
+    # чистка старых журналов
+    try:
+        d = get_log_dir()
+        files = sorted(f for f in os.listdir(d)
+                       if f.startswith("run_") and f.endswith(".log"))
+        for old in files[:-LOG_KEEP_COUNT]:
+            try:
+                os.remove(os.path.join(d, old))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    def _atexit():
+        _log.info("Завершение работы программы.")
+        for h in list(_log.handlers):
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    atexit.register(_atexit)
+    _log.info("Программа запущена. Каталог журнала: %s",
+              os.path.dirname(_log_file_path) if _log_file_path
+              else "(файл журнала не создан)")
+    return _log_file_path
+
+
+setup_logging()
 
 def _ensure_deps():
     """Автоматически устанавливает отсутствующие зависимости (xlrd,
@@ -104,6 +268,12 @@ def _fatal_missing_modules(modules, error=None):
            "вы запускаете программу)" % (", ".join(modules), " ".join(modules)))
     if error:
         msg += "\n\nТекст ошибки: %s" % error
+    try:
+        _log.error("Не найдены зависимости: %s", ", ".join(modules))
+        if error:
+            _log.error("Текст ошибки установки: %s", error)
+    except Exception:
+        pass
     try:
         import tkinter as _tk
         from tkinter import messagebox as _mb
@@ -421,7 +591,17 @@ def process(supplier_paths, target_path, out_path, multi_mode=False):
     if not supplier_paths:
         raise RuntimeError("Не выбран файл данных от поставщика.")
 
+    _log.info("Начало обработки (режим: %s).",
+              "несколько файлов поставщика" if multi_mode
+              else "один файл поставщика")
+    for i, p in enumerate(supplier_paths, 1):
+        _log.info("Файл поставщика %d: %s", i, p)
+    _log.info("Файл для загрузки в Комплекс: %s", target_path)
+    _log.info("Файл результата: %s", out_path)
+
     tgt_rows, tgt_header = read_tabular(target_path)
+    _log.debug("Файл загрузки прочитан: строк=%d, столбцов=%d.",
+               len(tgt_rows), len(tgt_header))
 
     warnings = []
 
@@ -442,6 +622,8 @@ def process(supplier_paths, target_path, out_path, multi_mode=False):
     missing_cols = []          # новые столбцы для файла загрузки (по порядку)
     for sp in supplier_paths:
         rows, header = read_tabular(sp)
+        _log.debug("Файл поставщика «%s» прочитан: строк=%d, столбцов=%d.",
+                   os.path.basename(sp), len(rows), len(header))
         if "KOD" not in header:
             raise RuntimeError(
                 "Код семьи не найден: в файле поставщика «%s» отсутствует "
@@ -602,8 +784,14 @@ def process(supplier_paths, target_path, out_path, multi_mode=False):
         warnings.append("Код семьи не найден в файле поставщика (проставлены 0): "
                         "%s" % ", ".join(unmatched))
 
+    for w in warnings:
+        _log.warning("%s", w)
+
     # --- запись результата ----------------------------------------------------
     out_path = write_output(out_path, columns, result, warnings)
+    _log.info("Обработка завершена: строк=%d, совпадений по KOD=%d, "
+              "не найдено KOD=%d, дублей=%d. Результат: %s",
+              len(result), matched, len(unmatched), len(dup_kods), out_path)
 
     summary = {
         "out_path": out_path,
@@ -827,6 +1015,13 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(frm, mode="indeterminate", length=640)
         self.progress.grid(row=6, column=0, columnspan=2, sticky="we", pady=(10, 0))
 
+        self.log_btn = ttk.Button(frm, text="Выгрузить журнал работы (.log)",
+                                  command=self.export_log)
+        self.log_btn.grid(row=7, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(frm, text="Открыть папку с журналами",
+                   command=self.open_log_folder).grid(
+            row=7, column=1, sticky="we", pady=(10, 0))
+
         frm.columnconfigure(0, weight=1)
 
         # ------- Вкладка 2: несколько файлов поставщика ---------------------
@@ -882,10 +1077,25 @@ class App(tk.Tk):
         self.multi_progress.grid(row=7, column=0, columnspan=2, sticky="we",
                                  pady=(10, 0))
 
+        self.multi_log_btn = ttk.Button(
+            frm2, text="Выгрузить журнал работы (.log)",
+            command=self.export_log)
+        self.multi_log_btn.grid(row=8, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(frm2, text="Открыть папку с журналами",
+                   command=self.open_log_folder).grid(
+            row=8, column=1, sticky="we", pady=(10, 0))
+
         frm2.columnconfigure(0, weight=1)
 
         self._result = None
         self._busy = False
+
+        # журнал работы: последние сообщения — в строку состояния
+        setup_logging()
+        self._ui_log_handler = UiLogHandler(self)
+        self._ui_log_handler.setLevel(logging.INFO)
+        _log.addHandler(self._ui_log_handler)
+        _log.info("Интерфейс запущен.")
 
     # ---- выбор файлов -------------------------------------------------------
     def pick_supplier(self):
@@ -976,6 +1186,9 @@ class App(tk.Tk):
         self._multi_mode = multi_mode
         self._active_btn = run_btn
         self._active_progress = progress
+        self._active_status = status
+        _log.info("Запуск обработки: файлов поставщика — %d, "
+                  "файл для загрузки — «%s».", len(sups), tgt)
         run_btn.config(state="disabled")
         progress.start(12)
         status.set("Идёт обработка…")
@@ -993,6 +1206,7 @@ class App(tk.Tk):
             self.after(0, self._done, res)
         except Exception as e:
             err = "".join(traceback.format_exception_only(type(e), e)).strip()
+            _log.exception("Ошибка при обработке данных: %s", err)
             self.after(0, self._fail, err)
 
     def _done(self, res):
@@ -1066,6 +1280,68 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка",
                                  "Не удалось сохранить отчёт:\n%s" % e)
 
+    # ---- выгрузка журнала работы (логов) ------------------------------------
+    def export_log(self):
+        """Сохраняет журнал работы программы в выбранный файл (.log/.txt)."""
+        _log.info("Выгрузка журнала работы программы.")
+        text = build_log_text()
+        default_name = "журнал_работы_%s.log" % datetime.now().strftime(
+            "%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Выгрузить журнал работы программы",
+            initialfile=default_name,
+            defaultextension=".log",
+            filetypes=[("Файлы журнала", "*.log"),
+                       ("Текстовые файлы", "*.txt"),
+                       ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(text)
+            self.status_var.set("Журнал сохранён: %s" % path)
+            _log.info("Журнал работы выгружен в файл: %s", path)
+            if os.name == "nt":
+                try:
+                    os.startfile(os.path.dirname(path))
+                except Exception:
+                    pass
+            messagebox.showinfo("Сохранено",
+                                "Журнал работы сохранён:\n%s" % path)
+        except OSError as e:
+            _log.error("Не удалось сохранить журнал: %s", e)
+            messagebox.showerror("Ошибка",
+                                 "Не удалось сохранить журнал:\n%s" % e)
+
+    def open_log_folder(self):
+        """Открывает папку с постоянными журналами работы программы."""
+        d = get_log_dir()
+        _log.info("Открытие папки с журналами: %s", d)
+        try:
+            if os.name == "nt":
+                os.startfile(d)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            else:
+                subprocess.Popen(["xdg-open", d])
+        except Exception as e:
+            messagebox.showinfo(
+                "Папка с журналами",
+                "Папка с журналами:\n%s\n\n(не удалось открыть автоматически: %s)"
+                % (d, e))
+
+    def _show_log_status(self, msg):
+        """Последняя запись журнала — в строку состояния (если нет активной)."""
+        try:
+            if getattr(self, "_busy", False):
+                return
+            active = getattr(self, "_active_status", None)
+            if active is None:
+                active = self.status_var
+            active.set("Журнал: %s" % msg)
+        except Exception:
+            pass
+
     # ---- скачивание результата ----------------------------------------------
     def _save_and_offer(self, auto_path):
         try:
@@ -1096,7 +1372,13 @@ class App(tk.Tk):
 
 
 def main():
-    App().mainloop()
+    try:
+        app = App()
+    except Exception:
+        _log.exception("Ошибка запуска графического интерфейса.")
+        raise
+    app.mainloop()
+    _log.info("Интерфейс закрыт, работа программы завершена.")
 
 
 if __name__ == "__main__":
