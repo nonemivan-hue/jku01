@@ -28,6 +28,10 @@
 10. Если SUM_N<N> в файле поставщика отрицательное -> переносится 0.
 11. После обработки предлагается скачать (сохранить) результат; имя файла
     соответствует имени файла для загрузки.
+12. Вкладка «Несколько файлов поставщика»: загружается несколько файлов
+    данных от поставщика (можно сразу несколько) и один файл для загрузки
+    в Комплекс. Логика та же, кроме: DOGOVOR1..16 = 1 только при наличии
+    данных в SUM_N1..16 (без проверки GLAVA), а поле GLAVA<N> очищается.
 
 Запуск: python app.py  (графический интерфейс, Windows)
 """
@@ -403,9 +407,20 @@ def read_tabular(path):
 # Основная обработка
 # ---------------------------------------------------------------------------
 
-def process(supplier_path, target_path, out_path):
-    """Выполняет обработку, пишет результат в out_path. Возвращает сводку."""
-    sup_rows, sup_header = read_tabular(supplier_path)
+def process(supplier_paths, target_path, out_path, multi_mode=False):
+    """Выполняет обработку, пишет результат в out_path. Возвращает сводку.
+
+    supplier_paths — путь к файлу поставщика или список путей (несколько
+    файлов). multi_mode=True (вкладка «Несколько файлов поставщика»):
+    DOGOVOR<N>=1 только при наличии данных в SUM_N<N> (без проверки GLAVA),
+    поле GLAVA<N> в результате очищается.
+    """
+    if isinstance(supplier_paths, str):
+        supplier_paths = [supplier_paths]
+    supplier_paths = [p for p in supplier_paths if p]
+    if not supplier_paths:
+        raise RuntimeError("Не выбран файл данных от поставщика.")
+
     tgt_rows, tgt_header = read_tabular(target_path)
 
     warnings = []
@@ -415,24 +430,53 @@ def process(supplier_path, target_path, out_path):
         raise RuntimeError(
             "Код семьи не найден: в файле для загрузки отсутствует "
             "столбец KOD.")
-    if "KOD" not in sup_header:
-        raise RuntimeError(
-            "Код семьи не найден: в файле поставщика отсутствует столбец KOD.")
 
-    # --- столбцы файла поставщика, которых нет в файле загрузки --------------
-    sup_data_cols = {c for c in sup_header
-                     if c not in ("RAION", "KOD", "ID_FIAS", "ID_KLADR",
-                                  "PUNKT", "STREET", "HOUSE", "KORP",
-                                  "FLAT", "KOM", "PERIOD")}
-    missing_cols = [c for c in sup_data_cols if c not in tgt_header]
+    ID_COLS = {"RAION", "KOD", "ID_FIAS", "ID_KLADR", "PUNKT", "STREET",
+               "HOUSE", "KORP", "FLAT", "KOM", "PERIOD"}
+
+    # --- чтение всех файлов поставщика ---------------------------------------
+    # Каждый файл имеет СВОЙ набор переносимых столбцов: данные переносятся
+    # только из тех столбцов, которые реально есть в данном файле (иначе
+    # пустые значения из одного файла затёрли бы данные из другого).
+    all_sup_rows = []
+    missing_cols = []          # новые столбцы для файла загрузки (по порядку)
+    for sp in supplier_paths:
+        rows, header = read_tabular(sp)
+        if "KOD" not in header:
+            raise RuntimeError(
+                "Код семьи не найден: в файле поставщика «%s» отсутствует "
+                "столбец KOD." % os.path.basename(sp))
+        src = os.path.basename(sp)
+        new_for_this = [c for c in header
+                        if c not in ID_COLS and c not in tgt_header
+                        and c not in missing_cols]
+        missing_cols.extend(new_for_this)
+        for r in rows:
+            r["__src__"] = src
+            r["__cols__"] = {c for c in header if c not in ID_COLS}
+        all_sup_rows.extend(rows)
+
     columns = list(tgt_header) + missing_cols
+
+    # гарантируем наличие столбцов DOGOVOR1..16 (могли быть в файле загрузки,
+    # но не войти в расчётный список; новые — добавляем сразу за блоком SUM_N)
+    def _ensure_after(col, anchor):
+        if col in columns:
+            return
+        if anchor in columns:
+            columns.insert(columns.index(anchor) + 1, col)
+        else:
+            columns.append(col)
+    for i in range(1, MAX_BLOCKS + 1):
+        _ensure_after("DOGOVOR%d" % i, "SUM_N%d" % i)
+
     if missing_cols:
         warnings.append("В файл загрузки добавлены столбцы из файла "
                         "поставщика: %s" % ", ".join(missing_cols))
 
     # --- индекс поставщика по KOD (при дублях — запись с наибольшей SUM_N) ---
     sup_groups = {}
-    for row in sup_rows:
+    for row in all_sup_rows:
         kod = cell_to_str(row.get("KOD"))
         if kod == "":
             continue
@@ -441,9 +485,11 @@ def process(supplier_path, target_path, out_path):
     sup_index = {k: (v[0] if len(v) == 1 else pick_max_block(v))
                  for k, v in sup_groups.items()}
     if dup_kods:
-        warnings.append("В файле поставщика KOD повторяется: %s — "
+        src_note = ("среди всех файлов поставщика" if len(supplier_paths) > 1
+                    else "в файле поставщика")
+        warnings.append("KOD повторяется %s: %s — "
                         "взята запись с наибольшей суммой (SUM_N)."
-                        % ", ".join(sorted(dup_kods)))
+                        % (src_note, ", ".join(sorted(dup_kods))))
 
     # --- итоговый набор столбцов --------------------------------------------
     new_col = "Определять тариф по площади"
@@ -471,7 +517,15 @@ def process(supplier_path, target_path, out_path):
                 out["MZADOLG%d" % i] = "0"
         else:
             matched += 1
+            sup_cols = sup.get("__cols__") or set()
+
+            # перенос блоков SUM_N/ZADOLG/MZADOLG — только если блок есть
+            # в данном файле поставщика (иначе оставляем то, что уже есть
+            # в строке файла загрузки; для пустого блока DOGOVOR станет 0)
             for i in range(1, MAX_BLOCKS + 1):
+                blk = ("SUM_N%d" % i, "MZADOLG%d" % i, "ZADOLG%d" % i)
+                if not any(b in sup_cols for b in blk):
+                    continue
                 s_sum = sup.get("SUM_N%d" % i)
                 s_mz = sup.get("MZADOLG%d" % i)
 
@@ -489,6 +543,8 @@ def process(supplier_path, target_path, out_path):
 
             # прочие столбцы поставщика, отсутствовавшие в файле загрузки
             for c in missing_cols:
+                if c not in sup_cols:
+                    continue
                 if c.startswith("SUM_N"):
                     mv = num_or_zero(sup.get(c))
                     if isinstance(mv, (int, float)) and mv < 0:
@@ -506,13 +562,19 @@ def process(supplier_path, target_path, out_path):
                 else:
                     out[c] = cell_to_str(sup.get(c))
 
-        # DOGOVOR1..16: если в полях GLAVA<N> (файл для загрузки,
-        # текстовые) ЕСТЬ значение и в SUM_N<N> (после переноса из
-        # поставщика) есть сумма -> 1, иначе 0. Считается ПОСЛЕ переноса
-        # данных, поэтому при пустой GLAVA<N> всегда 0.
+        # DOGOVOR1..16.
+        # Обычный режим: если в GLAVA<N> (файл для загрузки, текстовое) ЕСТЬ
+        # значение и в SUM_N<N> (после переноса) есть сумма -> 1, иначе 0.
+        # Режим «Несколько файлов поставщика»: DOGOVOR<N>=1 только при
+        # наличии данных в SUM_N<N> (GLAVA не проверяется), поле GLAVA<N>
+        # очищается. Считается ПОСЛЕ переноса данных.
         for i in range(1, MAX_BLOCKS + 1):
-            ok = (has_info(out.get("GLAVA%d" % i))
-                  and has_info(out.get("SUM_N%d" % i)))
+            if multi_mode:
+                ok = has_info(out.get("SUM_N%d" % i))
+                out["GLAVA%d" % i] = ""
+            else:
+                ok = (has_info(out.get("GLAVA%d" % i))
+                      and has_info(out.get("SUM_N%d" % i)))
             out["DOGOVOR%d" % i] = "1" if ok else "0"
 
         out[new_col] = "1"
@@ -549,12 +611,13 @@ def process(supplier_path, target_path, out_path):
         "matched": matched,
         "unmatched": unmatched,
         "warnings": warnings,
-        "supplier_path": supplier_path,
+        "supplier_paths": [os.path.abspath(p) for p in supplier_paths],
         "target_path": target_path,
         "report_rows": report_rows,
         "dup_kods": sorted(dup_kods),
         "missing_cols": missing_cols,
         "new_col": new_col,
+        "multi_mode": multi_mode,
     }
     return summary
 
@@ -564,11 +627,20 @@ def build_report_text(summary):
     lines = []
     add = lines.append
     add("ОТЧЁТ О ВЫПОЛНЕНИИ ОБРАБОТКИ ДАННЫХ")
+    if summary.get("multi_mode"):
+        add("Режим: несколько файлов данных от поставщика "
+            "(DOGOVOR<N>=1 при наличии SUM_N<N>, GLAVA<N> очищается)")
     add("=" * 60)
     add("Дата/время формирования: %s"
         % datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
     add("")
-    add("Файл данных от поставщика:   %s" % summary["supplier_path"])
+    sup_paths = summary.get("supplier_paths") or [summary.get("supplier_path")]
+    if len(sup_paths) > 1:
+        add("Файлы данных от поставщика (%d):" % len(sup_paths))
+        for i, p in enumerate(sup_paths, 1):
+            add("    %d. %s" % (i, p))
+    else:
+        add("Файл данных от поставщика:   %s" % sup_paths[0])
     add("Файл для загрузки в Комплекс: %s" % summary["target_path"])
     add("Файл результата:              %s" % summary["out_path"])
     add("")
@@ -613,8 +685,12 @@ def build_report_text(summary):
         "по KOD; при отсутствии KOD — 0;")
     add("— при дублях KOD переносится целиком запись с наибольшим SUM_N;")
     add("— отрицательная сумма SUM_N переносится как 0;")
-    add("— DOGOVOR<N>=1, если GLAVA<N> заполнена и SUM_N<N> содержит сумму, "
-        "иначе 0;")
+    if summary.get("multi_mode"):
+        add("— DOGOVOR<N>=1, если SUM_N<N> содержит сумму (без проверки "
+            "GLAVA<N>), иначе 0; поле GLAVA<N> очищено;")
+    else:
+        add("— DOGOVOR<N>=1, если GLAVA<N> заполнена и SUM_N<N> содержит "
+            "сумму, иначе 0;")
     add("— есть данные в MZADOLG<N> -> ZADOLG<N>=1, иначе 0;")
     add("— столбец «%s» = 1." % summary["new_col"])
     return "\r\n".join(lines) + "\r\n"
@@ -703,15 +779,24 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Обработчик данных поставщика для загрузки в Комплекс")
-        self.geometry("720x430")
+        self.geometry("760x520")
         self.resizable(False, False)
 
-        self.supplier_var = tk.StringVar()
-        self.target_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="Шаг 1. Выберите файл данных от поставщика (.dbf или Excel).")
+        self.supplier_var = tk.StringVar()      # путь (одна вкладка)
+        self.target_var = tk.StringVar()        # путь (вкладка 1)
+        self.multi_suppliers = []               # список путей (вкладка 2)
+        self.multi_target_var = tk.StringVar()  # путь (вкладка 2)
+        self.status_var = tk.StringVar(
+            value="Шаг 1. Выберите файл данных от поставщика (.dbf или Excel).")
+        self.multi_status_var = tk.StringVar(
+            value="Можно выбрать сразу несколько файлов поставщика.")
 
-        frm = ttk.Frame(self, padding=12)
-        frm.pack(fill="both", expand=True)
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # ---------------- Вкладка 1: один файл поставщика -------------------
+        frm = ttk.Frame(nb, padding=12)
+        nb.add(frm, text="  Один файл поставщика  ")
 
         ttk.Label(frm, text="1. Данные от поставщика (DBF / Excel):").grid(
             row=0, column=0, sticky="w")
@@ -728,7 +813,7 @@ class App(tk.Tk):
             row=3, column=1, padx=6)
 
         self.run_btn = ttk.Button(frm, text="Обработать данные",
-                                  command=self.start_process)
+                                  command=lambda: self.start_process(False))
         self.run_btn.grid(row=4, column=0, sticky="w", pady=(4, 10))
 
         self.report_btn = ttk.Button(frm, text="Скачать отчёт о выполнении (.txt)",
@@ -743,6 +828,61 @@ class App(tk.Tk):
         self.progress.grid(row=6, column=0, columnspan=2, sticky="we", pady=(10, 0))
 
         frm.columnconfigure(0, weight=1)
+
+        # ------- Вкладка 2: несколько файлов поставщика ---------------------
+        frm2 = ttk.Frame(nb, padding=12)
+        nb.add(frm2, text="  Несколько файлов поставщика  ")
+
+        ttk.Label(frm2, text="1. Данные от поставщика (можно выбрать "
+                             "сразу несколько файлов, DBF / Excel):").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+
+        lbfrm = ttk.Frame(frm2)
+        lbfrm.grid(row=1, column=0, sticky="we", pady=(2, 4))
+        self.multi_list = tk.Listbox(lbfrm, width=64, height=7,
+                                     exportselection=False)
+        sb = ttk.Scrollbar(lbfrm, command=self.multi_list.yview)
+        self.multi_list.config(yscrollcommand=sb.set)
+        self.multi_list.pack(side="left", fill="both")
+        sb.pack(side="right", fill="y")
+
+        btns = ttk.Frame(frm2)
+        btns.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Button(btns, text="Добавить файлы…",
+                   command=self.add_multi_suppliers).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Удалить выделенные",
+                   command=self.remove_multi_suppliers).pack(side="left", padx=6)
+        ttk.Button(btns, text="Очистить список",
+                   command=self.clear_multi_suppliers).pack(side="left", padx=6)
+
+        ttk.Label(frm2, text="2. Данные для загрузки в Комплекс (один Excel-файл):").grid(
+            row=3, column=0, sticky="w")
+        ttk.Entry(frm2, textvariable=self.multi_target_var, width=62).grid(
+            row=4, column=0, sticky="we", pady=(2, 12))
+        ttk.Button(frm2, text="Обзор…",
+                   command=self.pick_multi_target).grid(row=4, column=1, padx=6)
+
+        self.multi_run_btn = ttk.Button(
+            frm2, text="Обработать данные",
+            command=lambda: self.start_process(True))
+        self.multi_run_btn.grid(row=5, column=0, sticky="w", pady=(4, 10))
+
+        self.multi_report_btn = ttk.Button(
+            frm2, text="Скачать отчёт о выполнении (.txt)",
+            command=self.save_report, state="disabled")
+        self.multi_report_btn.grid(row=5, column=1, sticky="we", pady=(4, 10))
+
+        ttk.Label(frm2, textvariable=self.multi_status_var,
+                  foreground="#004085", wraplength=660,
+                  justify="left").grid(
+            row=6, column=0, columnspan=2, sticky="w")
+
+        self.multi_progress = ttk.Progressbar(frm2, mode="indeterminate",
+                                              length=640)
+        self.multi_progress.grid(row=7, column=0, columnspan=2, sticky="we",
+                                 pady=(10, 0))
+
+        frm2.columnconfigure(0, weight=1)
 
         self._result = None
         self._busy = False
@@ -762,32 +902,94 @@ class App(tk.Tk):
             self.target_var.set(path)
             self.status_var.set("Оба файла выбраны. Нажмите «Обработать данные».")
 
+    # ---- вкладка «Несколько файлов поставщика» ------------------------------
+    def add_multi_suppliers(self):
+        paths = filedialog.askopenfilenames(
+            title="Выберите файлы данных поставщика (можно несколько)",
+            filetypes=self.SUPPLIER_TYPES)
+        added = 0
+        for p in paths:
+            if p and p not in self.multi_suppliers:
+                self.multi_suppliers.append(p)
+                self.multi_list.insert("end", p)
+                added += 1
+        self.multi_status_var.set(
+            ("Добавлено файлов: %d. " % added if added else "") +
+            "Всего в списке: %d." % len(self.multi_suppliers))
+
+    def remove_multi_suppliers(self):
+        sel = list(self.multi_list.curselection())
+        for idx in reversed(sel):
+            self.multi_list.delete(idx)
+            del self.multi_suppliers[idx]
+        self.multi_status_var.set("Всего в списке: %d."
+                                  % len(self.multi_suppliers))
+
+    def clear_multi_suppliers(self):
+        self.multi_list.delete(0, "end")
+        self.multi_suppliers = []
+        self.multi_status_var.set("Список очищен.")
+
+    def pick_multi_target(self):
+        path = filedialog.askopenfilename(
+            title="Выберите файл для загрузки в Комплекс",
+            filetypes=self.TARGET_TYPES)
+        if path:
+            self.multi_target_var.set(path)
+            self.multi_status_var.set("Файл для загрузки выбран. "
+                                      "Нажмите «Обработать данные».")
+
     # ---- запуск обработки ---------------------------------------------------
-    def start_process(self):
+    def start_process(self, multi_mode):
         if self._busy:
             return
-        sup = self.supplier_var.get().strip()
-        tgt = self.target_var.get().strip()
-        if not sup or not os.path.isfile(sup):
-            messagebox.showerror("Ошибка", "Не выбран файл данных от поставщика.")
-            return
+        if multi_mode:
+            sups = list(self.multi_suppliers)
+            tgt = self.multi_target_var.get().strip()
+            status = self.multi_status_var
+            run_btn, progress = self.multi_run_btn, self.multi_progress
+            if not sups:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Не добавлено ни одного файла данных от поставщика.")
+                return
+            missing = [p for p in sups if not os.path.isfile(p)]
+            if missing:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Файл поставщика не найден:\n%s" % "\n".join(missing))
+                return
+        else:
+            s = self.supplier_var.get().strip()
+            sups = [s] if s else []
+            tgt = self.target_var.get().strip()
+            status = self.status_var
+            run_btn, progress = self.run_btn, self.progress
+            if not sups or not os.path.isfile(s):
+                messagebox.showerror("Ошибка", "Не выбран файл данных от поставщика.")
+                return
         if not tgt or not os.path.isfile(tgt):
             messagebox.showerror("Ошибка", "Не выбран файл для загрузки в Комплекс.")
             return
 
         self._busy = True
-        self.run_btn.config(state="disabled")
-        self.progress.pack() if False else self.progress.start(12)
-        self.status_var.set("Идёт обработка…")
-        threading.Thread(target=self._work, args=(sup, tgt), daemon=True).start()
+        self._multi_mode = multi_mode
+        self._active_btn = run_btn
+        self._active_progress = progress
+        run_btn.config(state="disabled")
+        progress.start(12)
+        status.set("Идёт обработка…")
+        threading.Thread(target=self._work, args=(sups, tgt, multi_mode),
+                         daemon=True).start()
 
-    def _work(self, sup, tgt):
+    def _work(self, sups, tgt, multi_mode):
         try:
             out_dir = os.path.dirname(tgt) or os.getcwd()
             base = os.path.basename(tgt)
             root_, ext_ = os.path.splitext(base)
-            out_path = os.path.join(out_dir, root_ + "_обработанный" + ext_)
-            res = process(sup, tgt, out_path)
+            suffix = "_обработанный_неск" if multi_mode else "_обработанный"
+            out_path = os.path.join(out_dir, root_ + suffix + ext_)
+            res = process(sups, tgt, out_path, multi_mode=multi_mode)
             self.after(0, self._done, res)
         except Exception as e:
             err = "".join(traceback.format_exception_only(type(e), e)).strip()
@@ -795,10 +997,12 @@ class App(tk.Tk):
 
     def _done(self, res):
         self._busy = False
-        self.progress.stop()
-        self.run_btn.config(state="normal")
+        self._active_progress.stop()
+        self._active_btn.config(state="normal")
+        multi = bool(res.get("multi_mode"))
         self._result = res
         self.report_btn.config(state="normal")
+        self.multi_report_btn.config(state="normal")
         # отчёт о выполнении сохраняется рядом с файлом результата
         report_path = os.path.splitext(res["out_path"])[0] + "_отчёт.txt"
         try:
@@ -809,9 +1013,12 @@ class App(tk.Tk):
             self._report_path = None
         msg = ("Обработка завершена. Строк: %d, совпадений по KOD: %d."
                % (res["rows"], res["matched"]))
+        if multi:
+            msg += " Режим «Несколько файлов поставщика»: DOGOVOR по SUM_N, GLAVA очищена."
         for w in res["warnings"]:
             msg += "\n⚠ " + w
-        self.status_var.set(msg)
+        status = self.multi_status_var if multi else self.status_var
+        status.set(msg)
         ask = ("Данные обработаны.\n\n%s\n\n"
                "Скачать (сохранить) файл результатов?" % msg)
         if messagebox.askyesno("Готово", ask):
@@ -823,8 +1030,8 @@ class App(tk.Tk):
 
     def _fail(self, err):
         self._busy = False
-        self.progress.stop()
-        self.run_btn.config(state="normal")
+        getattr(self, "_active_progress", self.progress).stop()
+        getattr(self, "_active_btn", self.run_btn).config(state="normal")
         self.status_var.set("Ошибка обработки.")
         messagebox.showerror("Ошибка", err)
 
