@@ -9,8 +9,9 @@
 2. Из файла поставщика в файл загрузки переносятся значения столбцов
    SUM_N1..SUM_N16, ZADOLG1..ZADOLG16, MZADOLG1..MZADOLG16
    (соединение строк по столбцу KOD).
-3. DOGOVOR1..DOGOVOR16: если в файле поставщика для блока
-   заполнены и GLAVA<N>, и SUM_N<N> (не пусто и не 0) -> 1, иначе 0.
+3. DOGOVOR1..DOGOVOR16: если в файле для загрузки GLAVA<N> (текстовое)
+   имеет значение и SUM_N<N> после переноса > 0 (не пусто и не 0;
+   отрицательная сумма переносится как 0) -> 1, иначе 0.
 4. В файл загрузки добавляется столбец "Определять тариф по площади" = 1.
 5. Если KOD отсутствует в файле поставщика -> в SUM_N/ZADOLG/MZADOLG
    ставятся 0. Если столбца KOD нет в файле для загрузки -> сообщение
@@ -452,13 +453,11 @@ def process(supplier_path, target_path, out_path):
                 out["SUM_N%d" % i] = "0"
                 out["ZADOLG%d" % i] = "0"
                 out["MZADOLG%d" % i] = "0"
-                out["DOGOVOR%d" % i] = "0"
         else:
             matched += 1
             for i in range(1, MAX_BLOCKS + 1):
                 s_sum = sup.get("SUM_N%d" % i)
                 s_mz = sup.get("MZADOLG%d" % i)
-                s_glava = sup.get("GLAVA%d" % i)
 
                 # перенос числовых данных из файла поставщика (пустое -> 0)
                 # отрицательная сумма переносится как 0
@@ -467,10 +466,6 @@ def process(supplier_path, target_path, out_path):
                     sv = 0
                 out["SUM_N%d" % i] = fmt_num(sv)
                 out["MZADOLG%d" % i] = fmt_num(num_or_zero(s_mz))
-
-                # DOGOVOR: GLAVA и SUM_N заполнены -> 1, иначе 0
-                ok = has_info(s_glava) and has_info(s_sum)
-                out["DOGOVOR%d" % i] = "1" if ok else "0"
 
                 # ZADOLG: есть информация в MZADOLG -> 1, иначе 0
                 out["ZADOLG%d" % i] = "1" if has_info(s_mz) else "0"
@@ -493,6 +488,15 @@ def process(supplier_path, target_path, out_path):
                     out[c] = cell_to_str(sup.get(c))
                 else:
                     out[c] = cell_to_str(sup.get(c))
+
+        # DOGOVOR1..16: если в полях GLAVA<N> (файл для загрузки,
+        # текстовые) ЕСТЬ значение и в SUM_N<N> (после переноса из
+        # поставщика) есть сумма -> 1, иначе 0. Считается ПОСЛЕ переноса
+        # данных, поэтому при пустой GLAVA<N> всегда 0.
+        for i in range(1, MAX_BLOCKS + 1):
+            ok = (has_info(out.get("GLAVA%d" % i))
+                  and has_info(out.get("SUM_N%d" % i)))
+            out["DOGOVOR%d" % i] = "1" if ok else "0"
 
         out[new_col] = "1"
         result.append(out)
