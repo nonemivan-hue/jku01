@@ -9,8 +9,8 @@
 2. Из файла поставщика в файл загрузки переносятся значения столбцов
    SUM_N1..SUM_N16, ZADOLG1..ZADOLG16, MZADOLG1..MZADOLG16
    (соединение строк по столбцу KOD).
-3. DOGOVOR1..DOGOVOR16: если в файле поставщика для этого номера блока
-   заполнены и GLAVA<N>, и SUM_N<N> -> 1, иначе 0.
+3. DOGOVOR1..DOGOVOR16: если в файле поставщика для блока
+   заполнены и GLAVA<N>, и SUM_N<N> (не пусто и не 0) -> 1, иначе 0.
 4. В файл загрузки добавляется столбец "Определять тариф по площади" = 1.
 5. Если KOD отсутствует в файле поставщика -> в SUM_N/ZADOLG/MZADOLG
    ставятся 0. Если столбца KOD нет в файле для загрузки -> сообщение
@@ -24,7 +24,8 @@
    то ZADOLG<N> = 1, иначе 0.
 9. Поля RAION, KOD, ID_FIAS, ID_KLADR, PUNKT, STREET, HOUSE, KORP, FLAT,
    KOM, PERIOD имеют текстовый формат.
-10. После обработки предлагается скачать (сохранить) результат; имя файла
+10. Если SUM_N<N> в файле поставщика отрицательное -> переносится 0.
+11. После обработки предлагается скачать (сохранить) результат; имя файла
     соответствует имени файла для загрузки.
 
 Запуск: python app.py  (графический интерфейс, Windows)
@@ -460,7 +461,11 @@ def process(supplier_path, target_path, out_path):
                 s_glava = sup.get("GLAVA%d" % i)
 
                 # перенос числовых данных из файла поставщика (пустое -> 0)
-                out["SUM_N%d" % i] = fmt_num(num_or_zero(s_sum))
+                # отрицательная сумма переносится как 0
+                sv = num_or_zero(s_sum)
+                if isinstance(sv, (int, float)) and sv < 0:
+                    sv = 0
+                out["SUM_N%d" % i] = fmt_num(sv)
                 out["MZADOLG%d" % i] = fmt_num(num_or_zero(s_mz))
 
                 # DOGOVOR: GLAVA и SUM_N заполнены -> 1, иначе 0
@@ -472,7 +477,12 @@ def process(supplier_path, target_path, out_path):
 
             # прочие столбцы поставщика, отсутствовавшие в файле загрузки
             for c in missing_cols:
-                if c.startswith(("SUM_N", "ZADOLG", "MZADOLG")):
+                if c.startswith("SUM_N"):
+                    mv = num_or_zero(sup.get(c))
+                    if isinstance(mv, (int, float)) and mv < 0:
+                        mv = 0
+                    out[c] = fmt_num(mv)
+                elif c.startswith(("ZADOLG", "MZADOLG")):
                     out[c] = fmt_num(num_or_zero(sup.get(c)))
                 elif c.startswith("DOGOVOR"):
                     n = c[len("DOGOVOR"):]
