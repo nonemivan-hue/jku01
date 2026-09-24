@@ -16,9 +16,9 @@
 5. Если KOD отсутствует в файле поставщика -> в SUM_N/ZADOLG/MZADOLG
    ставятся 0. Если столбца KOD нет в файле для загрузки -> сообщение
    "Код семьи не найден (нет столбца KOD в файле для загрузки)".
-6. Если KOD повторяется в файле поставщика несколько раз -> берётся
-   НАИБОЛЬШЕЕ значение SUM_N по каждому блоку (для ZADOLG/MZADOLG тоже
-   берётся максимум).
+6. Если KOD повторяется в файле поставщика несколько раз -> переносится
+   ЦЕЛИКОМ запись с НАИБОЛЬШИМ значением SUM_N (сравнение максимальных
+   сумм по всем блокам 1..16; при равенстве — первая из записей).
 7. GLAVA1..GLAVA16 имеют текстовый формат (значения из файла загрузки
    сохраняются как есть).
 8. Если в MZADOLG1..MZADOLG16 есть какая-либо информация (не пусто и не 0),
@@ -33,6 +33,7 @@
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -183,6 +184,32 @@ def num_or_zero(v):
     """Значение для переноса в SUM_N/ZADOLG/MZADOLG: число или 0."""
     n = to_number(v)
     return 0 if n is None else n
+
+
+def _block_index(col):
+    """'SUM_N3'/'MZADOLG12'/'ZADOLG4' -> 3/12/4, иначе None."""
+    m = re.match(r"^(?:SUM_N|MZADOLG|ZADOLG)(\d+)$", col)
+    return int(m.group(1)) if m else None
+
+
+def pick_max_block(rows):
+    """Из списка строк поставщика выбирает «наибольшую» по SUM_N.
+
+    Сравниваются суммы во всех блоках SUM_N1..SUM_N16: берётся строка,
+    у которой максимальная из сумм наибольшая (при равенстве — первая).
+    Если ни в одной строке нет заполненных SUM_N — возвращается первая.
+    """
+    best, best_key = None, None
+    for r in rows:
+        nums = [to_number(v) for c, v in r.items()
+                if c.startswith("SUM_N") and _block_index(c)]
+        nums = [n for n in nums if n is not None]
+        key = max(nums) if nums else None
+        if best is None:
+            best, best_key = r, key
+        elif key is not None and (best_key is None or key > best_key):
+            best, best_key = r, key
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -403,33 +430,19 @@ def process(supplier_path, target_path, out_path):
         warnings.append("В файл загрузки добавлены столбцы из файла "
                         "поставщика: %s" % ", ".join(missing_cols))
 
-    # --- индекс поставщика по KOD (максимумы при дублях) ---------------------
-    sup_index = {}
-    dup_kods = set()
+    # --- индекс поставщика по KOD (при дублях — запись с наибольшей SUM_N) ---
+    sup_groups = {}
     for row in sup_rows:
         kod = cell_to_str(row.get("KOD"))
         if kod == "":
             continue
-        if kod in sup_index:
-            dup_kods.add(kod)
-        cur = sup_index.get(kod)
-        merged = dict(cur) if cur else {}
-        for key, val in row.items():
-            if key.startswith(("SUM_N", "ZADOLG", "MZADOLG")):
-                a, b = to_number(merged.get(key)), to_number(val)
-                if a is None:
-                    merged[key] = val
-                elif b is not None and b > a:
-                    merged[key] = val
-            elif key.startswith("GLAVA"):
-                if not has_info(merged.get(key)) and has_info(val):
-                    merged[key] = val
-            else:
-                merged.setdefault(key, val)
-        sup_index[kod] = merged
+        sup_groups.setdefault(kod, []).append(row)
+    dup_kods = {k for k, v in sup_groups.items() if len(v) > 1}
+    sup_index = {k: (v[0] if len(v) == 1 else pick_max_block(v))
+                 for k, v in sup_groups.items()}
     if dup_kods:
         warnings.append("В файле поставщика KOD повторяется: %s — "
-                        "взяты наибольшие значения."
+                        "взята запись с наибольшей суммой (SUM_N)."
                         % ", ".join(sorted(dup_kods)))
 
     # --- итоговый набор столбцов --------------------------------------------
@@ -569,7 +582,7 @@ def build_report_text(summary):
            " (%s)" % ", ".join(summary["unmatched"]) if summary["unmatched"] else ""))
     add("Дублирующихся KOD у поставщика:    %d%s"
         % (len(summary["dup_kods"]),
-           " (%s) — взяты наибольшие значения" % ", ".join(summary["dup_kods"])
+           " (%s) — взята запись с наибольшей суммой" % ", ".join(summary["dup_kods"])
            if summary["dup_kods"] else ""))
     add("Столбец «%s»: добавлен, значение 1 во всех строках."
         % summary["new_col"])
@@ -598,7 +611,7 @@ def build_report_text(summary):
     add("Правила обработки:")
     add("— SUM_N/ZADOLG/MZADOLG 1..16 переносятся из файла поставщика "
         "по KOD; при отсутствии KOD — 0;")
-    add("— при дублях KOD берётся наибольшее значение SUM_N;")
+    add("— при дублях KOD переносится целиком запись с наибольшим SUM_N;")
     add("— отрицательная сумма SUM_N переносится как 0;")
     add("— DOGOVOR<N>=1, если GLAVA<N> заполнена и SUM_N<N> содержит сумму, "
         "иначе 0;")
