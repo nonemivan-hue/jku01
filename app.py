@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import traceback
+from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -440,12 +441,14 @@ def process(supplier_path, target_path, out_path):
     result = []
     matched = 0
     unmatched = []
+    report_rows = []  # построчная информация для отчёта о выполнении
     for row in tgt_rows:
         if all(cell_to_str(v) == "" for v in row.values()):
             continue
         kod = cell_to_str(row.get("KOD"))
         sup = sup_index.get(kod)
         out = dict(row)
+        neg_fixed = 0
         if sup is None:
             unmatched.append(kod)
             # данных поставщика нет -> во все блоки ставим 0
@@ -464,6 +467,7 @@ def process(supplier_path, target_path, out_path):
                 sv = num_or_zero(s_sum)
                 if isinstance(sv, (int, float)) and sv < 0:
                     sv = 0
+                    neg_fixed += 1
                 out["SUM_N%d" % i] = fmt_num(sv)
                 out["MZADOLG%d" % i] = fmt_num(num_or_zero(s_mz))
 
@@ -501,6 +505,24 @@ def process(supplier_path, target_path, out_path):
         out[new_col] = "1"
         result.append(out)
 
+        # строка отчёта о выполнении по данной семье
+        filled_blocks = sum(1 for i in range(1, MAX_BLOCKS + 1)
+                            if has_info(out.get("SUM_N%d" % i)))
+        dogovor_cnt = sum(1 for i in range(1, MAX_BLOCKS + 1)
+                          if out.get("DOGOVOR%d" % i) == "1")
+        zadolg_cnt = sum(1 for i in range(1, MAX_BLOCKS + 1)
+                         if out.get("ZADOLG%d" % i) == "1")
+        report_rows.append({
+            "kod": kod,
+            "status": ("совпал с файлом поставщика" if sup is not None
+                       else "код семьи не найден в файле поставщика — "
+                            "проставлены 0"),
+            "blocks": filled_blocks,
+            "dogovor": dogovor_cnt,
+            "zadolg": zadolg_cnt,
+            "neg": neg_fixed,
+        })
+
     if unmatched:
         warnings.append("Код семьи не найден в файле поставщика (проставлены 0): "
                         "%s" % ", ".join(unmatched))
@@ -512,9 +534,77 @@ def process(supplier_path, target_path, out_path):
         "out_path": out_path,
         "rows": len(result),
         "matched": matched,
+        "unmatched": unmatched,
         "warnings": warnings,
+        "supplier_path": supplier_path,
+        "target_path": target_path,
+        "report_rows": report_rows,
+        "dup_kods": sorted(dup_kods),
+        "missing_cols": missing_cols,
+        "new_col": new_col,
     }
     return summary
+
+
+def build_report_text(summary):
+    """Формирует текст отчёта о выполнении (для скачивания в .txt)."""
+    lines = []
+    add = lines.append
+    add("ОТЧЁТ О ВЫПОЛНЕНИИ ОБРАБОТКИ ДАННЫХ")
+    add("=" * 60)
+    add("Дата/время формирования: %s"
+        % datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    add("")
+    add("Файл данных от поставщика:   %s" % summary["supplier_path"])
+    add("Файл для загрузки в Комплекс: %s" % summary["target_path"])
+    add("Файл результата:              %s" % summary["out_path"])
+    add("")
+    add("-" * 60)
+    add("ИТОГИ")
+    add("-" * 60)
+    add("Всего строк обработано:            %d" % summary["rows"])
+    add("Совпадений по KOD с поставщиком:   %d" % summary["matched"])
+    add("KOD не найдено у поставщика:       %d%s"
+        % (len(summary["unmatched"]),
+           " (%s)" % ", ".join(summary["unmatched"]) if summary["unmatched"] else ""))
+    add("Дублирующихся KOD у поставщика:    %d%s"
+        % (len(summary["dup_kods"]),
+           " (%s) — взяты наибольшие значения" % ", ".join(summary["dup_kods"])
+           if summary["dup_kods"] else ""))
+    add("Столбец «%s»: добавлен, значение 1 во всех строках."
+        % summary["new_col"])
+    if summary["missing_cols"]:
+        add("Добавлены столбцы из файла поставщика: %s"
+            % ", ".join(summary["missing_cols"]))
+    add("")
+    add("-" * 60)
+    add("ПОСТРОЧНО (по KOD семьи)")
+    add("-" * 60)
+    for i, r in enumerate(summary["report_rows"], 1):
+        add("%d. KOD %s — %s; блоков с суммой: %d из 16; "
+            "DOGOVOR=1: %d; ZADOLG=1: %d; отрицательных SUM_N заменено на 0: %d"
+            % (i, r["kod"], r["status"], r["blocks"], r["dogovor"],
+               r["zadolg"], r["neg"]))
+    add("")
+    add("-" * 60)
+    add("ПРЕДУПРЕЖДЕНИЯ")
+    add("-" * 60)
+    if summary["warnings"]:
+        for w in summary["warnings"]:
+            add("⚠ " + w)
+    else:
+        add("Предупреждений нет.")
+    add("")
+    add("Правила обработки:")
+    add("— SUM_N/ZADOLG/MZADOLG 1..16 переносятся из файла поставщика "
+        "по KOD; при отсутствии KOD — 0;")
+    add("— при дублях KOD берётся наибольшее значение SUM_N;")
+    add("— отрицательная сумма SUM_N переносится как 0;")
+    add("— DOGOVOR<N>=1, если GLAVA<N> заполнена и SUM_N<N> содержит сумму, "
+        "иначе 0;")
+    add("— есть данные в MZADOLG<N> -> ZADOLG<N>=1, иначе 0;")
+    add("— столбец «%s» = 1." % summary["new_col"])
+    return "\r\n".join(lines) + "\r\n"
 
 
 def write_output(out_path, columns, result, warnings):
@@ -628,6 +718,10 @@ class App(tk.Tk):
                                   command=self.start_process)
         self.run_btn.grid(row=4, column=0, sticky="w", pady=(4, 10))
 
+        self.report_btn = ttk.Button(frm, text="Скачать отчёт о выполнении (.txt)",
+                                     command=self.save_report, state="disabled")
+        self.report_btn.grid(row=4, column=1, sticky="we", pady=(4, 10))
+
         ttk.Label(frm, textvariable=self.status_var, foreground="#004085",
                   wraplength=640, justify="left").grid(
             row=5, column=0, columnspan=2, sticky="w")
@@ -691,6 +785,15 @@ class App(tk.Tk):
         self.progress.stop()
         self.run_btn.config(state="normal")
         self._result = res
+        self.report_btn.config(state="normal")
+        # отчёт о выполнении сохраняется рядом с файлом результата
+        report_path = os.path.splitext(res["out_path"])[0] + "_отчёт.txt"
+        try:
+            with open(report_path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(build_report_text(res))
+            self._report_path = report_path
+        except OSError:
+            self._report_path = None
         msg = ("Обработка завершена. Строк: %d, совпадений по KOD: %d."
                % (res["rows"], res["matched"]))
         for w in res["warnings"]:
@@ -700,6 +803,10 @@ class App(tk.Tk):
                "Скачать (сохранить) файл результатов?" % msg)
         if messagebox.askyesno("Готово", ask):
             self._save_and_offer(res["out_path"])
+        if self._report_path and messagebox.askyesno(
+                "Отчёт о выполнении",
+                "Скачать отчёт о выполнении в формате .txt?"):
+            self.save_report()
 
     def _fail(self, err):
         self._busy = False
@@ -707,6 +814,37 @@ class App(tk.Tk):
         self.run_btn.config(state="normal")
         self.status_var.set("Ошибка обработки.")
         messagebox.showerror("Ошибка", err)
+
+    # ---- скачивание отчёта о выполнении -------------------------------------
+    def save_report(self):
+        res = getattr(self, "_result", None)
+        if not res:
+            messagebox.showinfo("Отчёт",
+                                "Сначала выполните обработку данных.")
+            return
+        text = build_report_text(res)
+        default_name = os.path.splitext(os.path.basename(res["out_path"]))[0] \
+            + "_отчёт.txt"
+        path = filedialog.asksaveasfilename(
+            title="Скачать отчёт о выполнении (.txt)",
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(text)
+            self.status_var.set("Отчёт сохранён: %s" % path)
+            if os.name == "nt":
+                try:
+                    os.startfile(os.path.dirname(path))
+                except Exception:
+                    pass
+            messagebox.showinfo("Сохранено", "Отчёт сохранён:\n%s" % path)
+        except OSError as e:
+            messagebox.showerror("Ошибка",
+                                 "Не удалось сохранить отчёт:\n%s" % e)
 
     # ---- скачивание результата ----------------------------------------------
     def _save_and_offer(self, auto_path):
