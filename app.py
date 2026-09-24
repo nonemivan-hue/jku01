@@ -41,9 +41,82 @@ import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-import dbfread
+def _ensure_deps():
+    """Автоматически устанавливает отсутствующие зависимости (xlrd,
+    openpyxl) через pip. Вызывается до импорта этих модулей. Работает и при
+    запуске из .exe, собранного PyInstaller. dbfread не требуется — для DBF
+    есть встроенный читатель."""
+    required = {"xlrd": "xlrd", "openpyxl": "openpyxl"}
+    missing = []
+    for module, pip_name in required.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(pip_name)
+    if not missing:
+        return
+    # Не пытаемся ставить пакеты внутри GUI-экзешника без Python — подскажем.
+    if getattr(sys, "frozen", False):
+        _fatal_missing_modules(missing)
+    print("Установка недостающих зависимостей: %s ..." % ", ".join(missing))
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--yes"] + missing)
+    except Exception:
+        # не удалось с --yes (старые версии pip) — пробуем без флага
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+        except Exception as e:
+            _fatal_missing_modules(missing, str(e))
+    # Обновляем sys.path на случай установки в каталог пользователя (--user)
+    import site
+    try:
+        user_site = site.getusersitepackages()
+        if user_site and user_site not in sys.path:
+            sys.path.append(user_site)
+    except Exception:
+        pass
+    still = [m for m in missing if not _can_import(m)]
+    if still:
+        _fatal_missing_modules(still)
+
+
+def _can_import(module):
+    try:
+        __import__(module)
+        return True
+    except ImportError:
+        return False
+
+
+def _fatal_missing_modules(modules, error=None):
+    msg = ("Не найдены модули: %s.\n"
+           "Установите их командой:\n"
+           "    python -m pip install %s\n"
+           "(если несколько версий Python — проверьте, каким python.exe "
+           "вы запускаете программу)" % (", ".join(modules), " ".join(modules)))
+    if error:
+        msg += "\n\nТекст ошибки: %s" % error
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        root = _tk.Tk()
+        root.withdraw()
+        _mb.showerror("Отсутствуют зависимости", msg)
+        root.destroy()
+    except Exception:
+        print(msg)
+    raise SystemExit(msg)
+
+
+_ensure_deps()
+
 import xlrd
 from openpyxl import Workbook, load_workbook
+
+try:
+    import dbfread
+except ImportError:          # необязательно: есть встроенный читатель DBF
+    dbfread = None
 
 MAX_BLOCKS = 16          # блоки 1..16
 TEXT_FIELDS = {          # поля, которые всегда сохраняются в текстовом формате
@@ -113,20 +186,129 @@ def num_or_zero(v):
 # Чтение файлов поставщика
 # ---------------------------------------------------------------------------
 
-def read_dbf(path):
-    """Чтение DBF -> список словарей {СТОЛБЕЦ: str}, порядок сохраняется."""
-    last_err = None
-    for enc in ("cp866", "cp1251", "utf-8", "latin1"):
+def _read_dbf_builtin(path):
+    """Встроенный читатель dBASE III/IV без внешних зависимостей.
+    Возвращает (rows:[dict], header:[str]) — значения в виде строк."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if len(data) < 32 or data[0] not in (0x03, 0x30, 0x31, 0xF5, 0xFB, 0x83):
+        raise RuntimeError("Файл не является DBF (dBASE).")
+    num_records = int.from_bytes(data[4:8], "little")
+    header_len = int.from_bytes(data[8:10], "little")
+    record_len = int.from_bytes(data[10:12], "little")
+    blk_size = int.from_bytes(data[28:30], "little") or 512
+    fields = []
+    off = 32
+    while off + 32 <= header_len and data[off] != 0x0D:
+        ftype = chr(data[off + 11])
+        flen = data[off + 16]
+        name = data[off:off + 11].split(b"\x00")[0]\
+            .decode("ascii", "ignore").strip()
+        fields.append((name, ftype, flen))
+        off += 32
+    has_memo = any(ft in ("M", "P") for _n, ft, _l in fields)
+    memo_path = None
+    mdata = b""
+    if has_memo:
+        memo_ext = ".dbt" if data[0] in (0x03, 0x83, 0xF5) else ".fpt"
+        memo_path = os.path.join(
+            os.path.dirname(os.path.abspath(path)),
+            os.path.splitext(os.path.basename(path))[0] + memo_ext)
+        if os.path.exists(memo_path):
+            with open(memo_path, "rb") as mf:
+                mdata = mf.read()
+
+    def read_memo(raw):
         try:
-            table = dbfread.DBF(path, encoding=enc)
-            rows = []
+            blknum = int(raw.decode("ascii", "ignore").strip() or 0)
+        except ValueError:
+            return ""
+        if blknum <= 0 or not mdata or blknum * blk_size >= len(mdata):
+            return ""
+        chunk = mdata[blknum * blk_size:]
+        end = chunk.find(b"\x1a\x1a")
+        if end == -1:
+            end = chunk.find(b"\x00")
+        return chunk[:end if end != -1 else len(chunk)]
+
+    def decode_text(b):
+        for enc in ("cp866", "cp1251", "utf-8", "latin1"):
+            try:
+                return b.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return b.decode("latin1")
+
+    rows = []
+    for i in range(num_records):
+        rec_start = header_len + i * record_len
+        if rec_start + record_len > len(data):
+            break
+        if data[rec_start:rec_start + 1] == b"*":   # помечена на удаление
+            continue
+        pos = rec_start + 1
+        row = {}
+        for name, ftype, flen in fields:
+            raw = data[pos:pos + flen]
+            pos += flen
+            if ftype in ("C", "V"):
+                val = decode_text(raw).strip()
+            elif ftype in ("N", "F"):
+                s = decode_text(raw).strip().replace(",", ".")
+                if s == "":
+                    val = ""
+                else:
+                    try:
+                        num = float(s)
+                        val = str(int(num)) if num == int(num) else repr(num)
+                    except ValueError:
+                        val = s
+            elif ftype == "D":
+                s = decode_text(raw).strip()
+                val = "%s.%s.%s" % (s[4:6], s[2:4], s[0:2]) if len(s) == 8 else s
+            elif ftype == "L":
+                c = chr(raw[0]).upper() if raw else "?"
+                val = "1" if c in "TY" else ("0" if c in "FN" else "")
+            elif ftype in ("M", "P"):
+                val = decode_text(read_memo(raw)).strip()
+            else:
+                val = decode_text(raw).strip()
+            row[norm_name(name)] = val
+        rows.append(row)
+    header = [norm_name(n) for n, _t, _l in fields]
+    return rows, header
+
+
+def read_dbf(path):
+    """Чтение DBF -> список словарей {СТОЛБЕЦ: str}, порядок сохраняется.
+    Используется библиотека dbfread (если установлена), иначе — встроенный
+    читатель, не требующий зависимостей."""
+    if dbfread is not None:
+        try:
+            table = dbfread.DBF(path, encoding="cp866")
             cols = [norm_name(f.name) for f in table.fields]
-            for rec in table:
-                rows.append({norm_name(k): cell_to_str(v) for k, v in rec.items()})
+            rows = [{norm_name(k): cell_to_str(v) for k, v in rec.items()}
+                    for rec in table]
             return rows, cols
-        except Exception as e:  # пробуем следующую кодировку
-            last_err = e
-    raise RuntimeError("Не удалось прочитать DBF-файл: %s" % last_err)
+        except UnicodeDecodeError:
+            pass                       # попробуем другие кодировки ниже
+        except Exception as e:
+            raise RuntimeError("Не удалось прочитать DBF-файл: %s" % e)
+        last_err = None
+        for enc in ("cp1251", "utf-8", "latin1"):
+            try:
+                table = dbfread.DBF(path, encoding=enc)
+                cols = [norm_name(f.name) for f in table.fields]
+                rows = [{norm_name(k): cell_to_str(v) for k, v in rec.items()}
+                        for rec in table]
+                return rows, cols
+            except Exception as e:
+                last_err = e
+        try:
+            return _read_dbf_builtin(path)
+        except Exception:
+            raise RuntimeError("Не удалось прочитать DBF-файл: %s" % last_err)
+    return _read_dbf_builtin(path)
 
 
 def _rows_from_xlrd(path):
