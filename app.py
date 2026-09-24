@@ -34,6 +34,9 @@
     данных в SUM_N1..16 (без проверки GLAVA), а поле GLAVA<N> очищается.
 13. Программа ведёт журнал работы (логи) в папке «логи» рядом с программой;
     журнал можно выгрузить кнопкой «Выгрузить журнал работы (.log)».
+14. При обработке нескольких файлов поставщика любая ошибка сопровождается
+    сообщением о том, на каком файле (и на каком этапе: чтение файла
+    поставщика / файла загрузки / запись результата) она возникла.
 
 Запуск: python app.py  (графический интерфейс, Windows)
 """
@@ -573,6 +576,39 @@ def read_tabular(path):
                        "Можно загрузить .dbf, .xls или .xlsx" % ext)
 
 
+class FileProcessError(RuntimeError):
+    """Ошибка обработки с указанием файла и этапа, на котором она возникла."""
+
+    def __init__(self, message, path=None, stage=None):
+        self.path = path
+        self.stage = stage
+        super().__init__(message)
+
+
+def _describe_file(path, index=None, total=None):
+    """Имя файла для сообщений об ошибках (с номером, если файлов несколько)."""
+    name = os.path.basename(str(path)) if path else "?"
+    if index is not None and total is not None and total > 1:
+        return "файл поставщика №%d из %d «%s»" % (index, total, name)
+    return "файл «%s»" % name
+
+
+def _file_error(exc, path, stage, index=None, total=None):
+    """Оборачивает исключение в сообщение с указанием файла и этапа.
+
+    Если текст ошибки уже содержит имя этого файла — не дублирует его.
+    """
+    text = str(exc).strip() or exc.__class__.__name__
+    name = os.path.basename(str(path)) if path else ""
+    desc = _describe_file(path, index, total)
+    if not name or name in text:
+        # в тексте ошибки уже есть имя файла — оставляем только номер файла
+        desc = "файл №%d из %d" % (index, total)
+    err = FileProcessError("Ошибка при %s (%s):\n%s" % (stage, desc, text),
+                           path=path, stage=stage)
+    return err
+
+
 # ---------------------------------------------------------------------------
 # Основная обработка
 # ---------------------------------------------------------------------------
@@ -599,7 +635,11 @@ def process(supplier_paths, target_path, out_path, multi_mode=False):
     _log.info("Файл для загрузки в Комплекс: %s", target_path)
     _log.info("Файл результата: %s", out_path)
 
-    tgt_rows, tgt_header = read_tabular(target_path)
+    try:
+        tgt_rows, tgt_header = read_tabular(target_path)
+    except Exception as e:
+        raise _file_error(e, target_path,
+                          "чтении файла для загрузки в Комплекс") from e
     _log.debug("Файл загрузки прочитан: строк=%d, столбцов=%d.",
                len(tgt_rows), len(tgt_header))
 
@@ -607,9 +647,10 @@ def process(supplier_paths, target_path, out_path, multi_mode=False):
 
     # --- проверка наличия KOD ------------------------------------------------
     if "KOD" not in tgt_header:
-        raise RuntimeError(
-            "Код семьи не найден: в файле для загрузки отсутствует "
-            "столбец KOD.")
+        raise FileProcessError(
+            "Код семьи не найден: в файле для загрузки «%s» отсутствует "
+            "столбец KOD." % os.path.basename(str(target_path)),
+            path=target_path, stage="проверке файла для загрузки")
 
     ID_COLS = {"RAION", "KOD", "ID_FIAS", "ID_KLADR", "PUNKT", "STREET",
                "HOUSE", "KORP", "FLAT", "KOM", "PERIOD"}
@@ -620,14 +661,25 @@ def process(supplier_paths, target_path, out_path, multi_mode=False):
     # пустые значения из одного файла затёрли бы данные из другого).
     all_sup_rows = []
     missing_cols = []          # новые столбцы для файла загрузки (по порядку)
-    for sp in supplier_paths:
-        rows, header = read_tabular(sp)
+    total = len(supplier_paths)
+    for idx, sp in enumerate(supplier_paths, 1):
+        try:
+            rows, header = read_tabular(sp)
+        except Exception as e:
+            _log.error("Ошибка при чтении файла поставщика №%d из %d: %s",
+                       idx, total, os.path.abspath(sp))
+            raise _file_error(e, sp,
+                              "чтении файла поставщика №%d из %d" % (idx, total),
+                              index=idx, total=total) from e
         _log.debug("Файл поставщика «%s» прочитан: строк=%d, столбцов=%d.",
                    os.path.basename(sp), len(rows), len(header))
         if "KOD" not in header:
-            raise RuntimeError(
-                "Код семьи не найден: в файле поставщика «%s» отсутствует "
-                "столбец KOD." % os.path.basename(sp))
+            err = _file_error(
+                "Код семьи не найден: отсутствует столбец KOD.",
+                sp, "проверке файла поставщика №%d из %d" % (idx, total),
+                index=idx, total=total)
+            _log.error("%s", err)
+            raise err from None
         src = os.path.basename(sp)
         new_for_this = [c for c in header
                         if c not in ID_COLS and c not in tgt_header
@@ -788,7 +840,11 @@ def process(supplier_paths, target_path, out_path, multi_mode=False):
         _log.warning("%s", w)
 
     # --- запись результата ----------------------------------------------------
-    out_path = write_output(out_path, columns, result, warnings)
+    try:
+        out_path = write_output(out_path, columns, result, warnings)
+    except Exception as e:
+        _log.error("Ошибка при записи файла результата: %s", e)
+        raise _file_error(e, out_path, "записи файла результата") from e
     _log.info("Обработка завершена: строк=%d, совпадений по KOD=%d, "
               "не найдено KOD=%d, дублей=%d. Результат: %s",
               len(result), matched, len(unmatched), len(dup_kods), out_path)
@@ -1165,9 +1221,11 @@ class App(tk.Tk):
                 return
             missing = [p for p in sups if not os.path.isfile(p)]
             if missing:
+                idxs = ", ".join(str(sups.index(p) + 1) for p in missing)
                 messagebox.showerror(
                     "Ошибка",
-                    "Файл поставщика не найден:\n%s" % "\n".join(missing))
+                    "Файл поставщика не найден (№%d из %d):\n%s"
+                    % (idxs, len(sups), "\n".join(missing)))
                 return
         else:
             s = self.supplier_var.get().strip()
@@ -1204,6 +1262,15 @@ class App(tk.Tk):
             out_path = os.path.join(out_dir, root_ + suffix + ext_)
             res = process(sups, tgt, out_path, multi_mode=multi_mode)
             self.after(0, self._done, res)
+        except FileProcessError as e:
+            # сообщение уже содержит имя файла и этап — показываем его целиком
+            err = str(e)
+            if e.path:
+                err += "\n\nПолный путь: %s" % os.path.abspath(e.path)
+            _log.error("Ошибка при обработке данных (этап: %s, файл: %s): %s",
+                       e.stage, os.path.abspath(e.path) if e.path else "?",
+                       err)
+            self.after(0, self._fail, err)
         except Exception as e:
             err = "".join(traceback.format_exception_only(type(e), e)).strip()
             _log.exception("Ошибка при обработке данных: %s", err)
@@ -1246,7 +1313,10 @@ class App(tk.Tk):
         self._busy = False
         getattr(self, "_active_progress", self.progress).stop()
         getattr(self, "_active_btn", self.run_btn).config(state="normal")
-        self.status_var.set("Ошибка обработки.")
+        multi = bool(getattr(self, "_multi_mode", False))
+        status = self.multi_status_var if multi else self.status_var
+        # в строке состояния — первая строка сообщения (с именем файла)
+        status.set("Ошибка: " + str(err).splitlines()[0])
         messagebox.showerror("Ошибка", err)
 
     # ---- скачивание отчёта о выполнении -------------------------------------
